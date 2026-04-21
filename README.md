@@ -1,6 +1,11 @@
 # SunBlinds 🕶️☀️
 
-A Control4 DriverWorks driver that fires glare events per-window based on sun position, weather, and home orientation. The driver is an **event emitter only** — it does not command blinds directly. Dealers and homeowners wire the emitted events into their own programming to raise, lower, or tilt shades.
+A Control4 DriverWorks driver suite that fires per-window glare events and, optionally, actively controls motorized blinds — descending them only as far as needed to block direct sun from a specific "protected point" in the room (a TV, a reading chair, a pillow).
+
+Each window runs in one of two modes:
+
+- **Event Only** — fires `Glare_Start` / `Glare_End`; dealer programs the response.
+- **Controlled** — binds to a motorized shade and commands it directly using a 4-parameter physics model of the window + protected point. The model is calibrated either by entering a few datetime pairs of observed glare events (blind fully closed), or by self-learning from a lux sensor placed at the protected point.
 
 ---
 
