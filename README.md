@@ -1,11 +1,13 @@
 # SunBlinds 🕶️☀️
 
-A Control4 DriverWorks driver suite that fires per-window glare events and, optionally, actively controls motorized blinds — descending them only as far as needed to block direct sun from a specific "protected point" in the room (a TV, a reading chair, a pillow).
+A Control4 DriverWorks driver suite that models each window as a **physical geometry** (wall orientation, horizon obstructions, overhang) and — using the sun's position and live weather — decides whether direct sun is currently entering the room. Optionally, each window can be upgraded to **Controlled mode** by providing protected-point geometry (TV, reading chair, pillow) and a motorized shade binding; the same physics model then computes the minimum blind descent needed to block direct sun from that point.
 
 Each window runs in one of two modes:
 
-- **Event Only** — fires `Glare_Start` / `Glare_End`; dealer programs the response.
-- **Controlled** — binds to a motorized shade and commands it directly using a 4-parameter physics model of the window + protected point. The model is calibrated either by entering a few datetime pairs of observed glare events (blind fully closed), or by self-learning from a lux sensor placed at the protected point.
+- **Event Only** — fires `Glare_Start` / `Glare_End`. Fits 3 geometric parameters. Dealer programs the response.
+- **Controlled** — binds to a motorized shade and commands it directly. Fits the same 3 parameters plus 4 protected-point parameters.
+
+Both modes share the same calibration pipeline — dealer enters a few observation-pair datetimes, or binds a lux sensor and lets the driver self-learn. Raw samples are discarded after convergence; only the fitted parameters persist. The model is keyed on sun position, so it transfers across seasons by construction.
 
 ---
 

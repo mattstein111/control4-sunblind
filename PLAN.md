@@ -6,19 +6,26 @@ Last updated: 2026-04-21
 
 ## 1. Scope
 
-SunBlinds is a Control4 DriverWorks driver suite that fires per-window glare events and, optionally, **actively controls motorized blinds** to block the sun from reaching a specific "protected point" in the room. Each window proxy runs in one of two modes:
+SunBlinds is a Control4 DriverWorks driver suite that models each window as a **physical geometry** — wall orientation, horizon obstructions, overhang — and uses that geometry to fire per-window glare events. Optionally, each window can be upgraded to **Controlled mode** by adding protected-point geometry and binding a motorized shade — in which case the same physics model also computes the minimum blind descent needed to block direct sun from the protected point.
 
-- **Event Only** — fires `Glare_Start`/`Glare_End` events. Dealer programs the response. No direct control. This is the default and the v1 baseline.
-- **Controlled** — commands a bound motorized shade directly, descending only as far as required to keep direct sun off the protected point. Uses a 4-parameter physics model (see §10) calibrated in one of two ways:
-  - **Manual calibration** — dealer enters datetime stamps of observed glare start and end while the blind is fully closed (gives two constraints).
-  - **Self-learn with lux sensor** — a lux sensor at the protected point drives automated micro-probing; the driver moves the blind in small increments and learns the geometry from observed lux responses.
+One physics model, shared across both modes. Event Only is the same solver asking "does any direct sun enter the room?"; Controlled is the same solver asking "does direct sun reach *this point*, and if so how much blind descent blocks it?"
+
+Each window proxy runs in one of two modes:
+
+- **Event Only** — fires `Glare_Start`/`Glare_End` events when direct sun is entering the room. Dealer programs the response. No direct shade control. Requires 3 geometric parameters (see §8).
+- **Controlled** — commands a bound motorized shade directly, descending only as far as required to block direct sun from the configured protected point. Requires the 3 Event-Only params plus 4 protected-point params (7 total).
+
+Both modes share the same calibration machinery:
+
+- **Manual calibration** — dealer records datetime stamps of observed glare start and end at a reference point (any sunny spot for Event Only; the specific protected point for Controlled). Each pair gives 2 constraints. 2+ pairs fit the model.
+- **Self-learn with lux sensor** — lux sensor at the reference point drives automated micro-probing and least-squares fitting. Raw samples discarded after convergence; only the fitted parameters persist.
 
 Two driver types are packaged together:
 
 | Driver | Role | Quantity per project |
 |---|---|---|
 | `SunBlinds Manager` (parent) | Holds location, polls weather, computes sun position, aggregates window state | 1 |
-| `SunBlinds Window` (child) | One per window. In Event Only mode: holds geometry, fires glare events. In Controlled mode: also binds to a motorized shade and (optionally) a lux sensor, runs the physics solver, commands the shade. | N |
+| `SunBlinds Window` (child) | One per window. Runs the physics solver. Fires events. In Controlled mode, also binds a shade and commands position. | N |
 
 ---
 
@@ -80,83 +87,115 @@ Windows are removed by deleting the child proxy in Composer; the parent reconcil
 | Property | Type | Default | Notes |
 |---|---|---|---|
 | Mode | LIST | `Event Only` | `Event Only` / `Controlled` |
-| Window azimuth (°) | NUMBER | 180 | 0=N, 90=E, 180=S, 270=W |
-| View half-angle (°) | NUMBER | 45 | ± around azimuth |
-| Min sun elevation (°) | NUMBER | 5 | sun below = no glare |
-| Max sun elevation (°) | NUMBER | 70 | sun above = no glare (overhang) |
-| Cloud cover threshold (%) | NUMBER | 40 | direct-sun gating threshold |
-| On-delay (min) | NUMBER | 5 | hysteresis — sun must stay in zone this long |
-| Off-delay (min) | NUMBER | 10 | hysteresis — sun must stay out of zone this long |
-| Calibrate: Glare Start datetime | STRING | — | ISO 8601 local, e.g. `2026-04-21T14:30` |
-| Calibrate: Glare End datetime | STRING | — | ISO 8601 local |
+| Wall azimuth (°) | NUMBER | 180 | 0=N, 90=E, 180=S, 270=W — outward normal of the window's wall |
+| Horizon obstruction elevation (°) | NUMBER | 5 | sun below this angle cannot illuminate the window (trees, hill, neighbor) |
+| Overhang cutoff elevation (°) | NUMBER | 70 | sun above this angle is blocked by roof eave / overhang |
+| Cloud cover threshold (%) | NUMBER | 40 | direct-sun gating threshold — skip glare when clouds above this |
+| On-delay (min) | NUMBER | 5 | hysteresis — condition must hold this long before `Glare_Start` |
+| Off-delay (min) | NUMBER | 10 | hysteresis — condition must clear this long before `Glare_End` |
+| Calibration method | LIST | `Manual datetime` | `Manual datetime` / `Self-learn (lux sensor)` |
+| Lux sensor binding | binding | — | optional in Event Only, enables self-learn calibration |
+| Lux threshold | NUMBER | 1000 | glare threshold at reference point (lux) — only used if lux sensor bound |
+| Observation log | STRING (readonly) | — | list of recorded `(start_dt, end_dt)` calibration pairs |
+| Model converged | readonly bool | — | fit has enough constraints and residual is acceptable |
+| Model parameters | readonly string | — | e.g. `"wall_az=182°, horizon=4°, overhang=64°"` |
 | Glare Active | readonly bool | — | live |
-| Last reason | readonly string | — | e.g. `"sun in arc (az 205°), cloud 22%, elev 34°"` |
+| Last reason | readonly string | — | e.g. `"sun ray enters room (az 205°, elev 34°), clouds 22%"` |
 
 ### Controlled-mode properties (additional)
 
 | Property | Type | Default | Notes |
 |---|---|---|---|
 | Shade binding | binding | — | C4 connection to a motorized shade/blind driver |
-| Lux sensor binding | binding | — | optional; C4 connection to an illuminance source (any lux-reporting device) |
 | Control surface | LIST | `Auto-detect` | `Percent` / `Timed Up-Down-Stop` / `Preset Slots` / `Binary` / `Auto-detect` |
 | Shade travel time (s) | NUMBER | — | for Timed control surface — seconds from fully up to fully down |
+| Shade travel length (cm) | NUMBER | — | physical distance blind covers from fully up to fully down |
 | Preset slot map | STRING | — | for Preset control surface — e.g. `"1=25, 2=50, 3=75, 4=100"` |
-| Blind opacity | LIST | `Blackout` | `Blackout` / `Room-darkening` / `Sheer` — affects settle tolerance |
-| Calibration method | LIST | `Self-learn (lux sensor)` | `Self-learn (lux sensor)` / `Manual datetime (blind fully closed)` / `Tape measure (geometry)` |
-| Lux threshold | NUMBER | 1000 | glare threshold at the protected point, in lux |
+| Blind opacity | LIST | `Blackout` | `Blackout` / `Room-darkening` / `Sheer` |
+| Window top height (cm) | NUMBER | — | top edge of window above the floor (physics param, can be calibrated) |
+| Protected point depth (cm) | NUMBER | — | distance from window plane into room (physics param, can be calibrated) |
+| Protected point height (cm) | NUMBER | — | height of protected point above floor (physics param, can be calibrated) |
 | Probe interval (min) | NUMBER | 10 | minimum time between probe moves during self-learn |
 | Probe step (%) | NUMBER | 5 | smallest blind position increment |
 | Manual override timeout (min) | NUMBER | 30 | pause auto after a detected manual move |
-| Learning status | readonly string | — | e.g. `"Self-learning, 47 samples, model not yet converged"` |
-| Model parameters | readonly string | — | e.g. `"window_top=210cm, point_depth=180cm, point_height=95cm, wall_az=182°"` |
 | Target position (%) | readonly | — | last computed target |
 | Current position (%) | readonly | — | last commanded / reported position |
+| Learning samples count | readonly | — | during self-learn |
 
-### Actions
+### Actions (both modes)
 
-- `Calibrate From Date/Time Window` (Event Only mode) — reads both datetime fields; computes azimuth, half-angle, elevation bounds; stamps into properties.
-- `Calibrate From Date/Time Window` (Controlled mode, `Manual datetime` method) — interprets the two datetimes as "while the blind was fully closed, glare was observed starting at T1 and ending at T2" at the protected point. Combines the two sun positions into constraints on the 4-parameter physics model. Repeat across several observed glare events over different days to fully constrain the model.
-- `Start Self-Learn` (Controlled mode) — enters passive+active learning mode. Records `(timestamp, az, elev, cloud_cover, blind_position, lux)` samples at 15-min resolution. During clear-sky daytime periods, automatically nudges the blind by the probe step every probe interval to gather constraint samples. Runs until operator calls `Stop Self-Learn` or the model converges.
-- `Stop Self-Learn` — freezes learning, keeps the current physics model in effect.
-- `Refit Model Now` — re-runs the least-squares fit on accumulated samples.
-- `Discard Learning Data` — wipes the sample buffer and model parameters; starts over.
-- `Test Glare Now` — logs current reason and, if Controlled, what blind position *would* be commanded.
-- `Manual Pause (N minutes)` — temporarily halts auto control.
+- `Record Calibration Observation` — reads the Calibrate Start/End datetime fields (entered by dealer) and appends this pair to the observation log. Calibration fits as many model parameters as the current observations can constrain.
+  - Event Only mode: dealer enters the datetimes when glare was observed starting and ending anywhere in the sunlit zone. Each pair constrains 2 of the 3 Event-Only params; 2+ pairs fit the model.
+  - Controlled mode: dealer enters the datetimes while **blind was fully closed** and glare was observed at the protected point. Each pair constrains 2 of the 7 params; 4+ pairs fit the full model (fewer if some params are provided by tape measure).
+- `Start Self-Learn` — requires lux sensor binding. Records `(timestamp, az, elev, cloud_cover, blind_position, lux)` at 15-min resolution. In Controlled mode, actively nudges the blind by probe step every probe interval during clear-sky periods.
+- `Stop Self-Learn` — freezes learning, keeps current model in effect.
+- `Refit Model Now` — re-runs least-squares fit on current observations.
+- `Discard Calibration Data` — wipes observations and model parameters.
+- `Test Glare Now` — logs current reason, and in Controlled mode, what position would be commanded.
+- `Manual Pause (N minutes)` — Controlled mode — temporarily halts auto control.
 
 ### Events
 
-- `Glare_Start` / `Glare_End` (both modes)
-- `Blind_Adjusted` (Controlled mode; includes fromPercent, toPercent, reason)
-- `Manual_Override_Detected` (Controlled mode with position feedback)
-- `Model_Converged` (Controlled mode, once fit is confident)
+- `Glare_Start` / `Glare_End` — both modes
+- `Blind_Adjusted` — Controlled mode (from%, to%, reason)
+- `Manual_Override_Detected` — Controlled mode when position feedback disagrees with last command
+- `Model_Converged` — both modes, when fit is confident
 
 ### Variables
 
 - `GLARE_ACTIVE` (bool)
-- `WINDOW_AZIMUTH` (number)
+- `WALL_AZIMUTH` (number)
+- `SUN_ENTERING_ROOM` (bool) — is direct sun currently reaching the room interior?
 - `LAST_GLARE_START` / `LAST_GLARE_END` (timestamp)
-- Controlled-only: `TARGET_POSITION`, `CURRENT_POSITION`, `MODEL_CONVERGED` (bool), `LUX_CURRENT`, `LEARNING_SAMPLES_COUNT`
+- `MODEL_CONVERGED` (bool)
+- Controlled-only: `TARGET_POSITION`, `CURRENT_POSITION`, `LUX_CURRENT`, `LEARNING_SAMPLES_COUNT`
 
 ---
 
 ## 4. Glare decision logic
 
-For each window, every tick (after any sun or weather update):
+For each window, every tick, the physics solver is invoked with the current sun position and the window's fitted parameters. The solver returns:
+
+- `sun_entering_room` (bool) — does a direct sun ray currently pass through the window plane into the room interior, given wall_azimuth + horizon_obstruction + overhang_cutoff?
+- `sun_reaches_protected_point` (bool, Controlled only)
+- `required_blind_position` (%, Controlled only)
+
+### Event Only
 
 ```
-in_arc         = angular_diff(sun_azimuth, window_azimuth) <= view_half_angle
-elev_ok        = min_elevation <= sun_elevation <= max_elevation
-sunny_enough   = cloud_cover <= cloud_threshold
-raw_glare      = in_arc AND elev_ok AND sunny_enough
-
-# hysteresis
-if raw_glare and not glare_active:
-    if raw_glare has been true continuously for on_delay → glare_active = true, fire Glare_Start
-if not raw_glare and glare_active:
-    if raw_glare has been false continuously for off_delay → glare_active = false, fire Glare_End
+raw_glare = sun_entering_room AND cloud_cover <= cloud_threshold
 ```
 
-`angular_diff` wraps modulo 360 and always returns the shortest arc.
+### Controlled
+
+```
+raw_glare = sun_reaches_protected_point AND cloud_cover <= cloud_threshold
+# raw_glare implies required_blind_position > 0
+```
+
+### Common hysteresis + dispatch
+
+```
+if raw_glare and not glare_active and raw_glare held for on_delay:
+    glare_active = true, fire Glare_Start
+if not raw_glare and glare_active and not_raw_glare held for off_delay:
+    glare_active = false, fire Glare_End
+
+# Controlled only
+if Mode == Controlled and model_converged:
+    command shade to required_blind_position, rounded to probe_step
+    if position changed: fire Blind_Adjusted
+```
+
+### `sun_entering_room` (Event Only subset of the physics)
+
+```
+in_azimuth_range = |angular_diff(sun_azimuth, wall_azimuth)| < 90°   -- sun must be on window's side of the wall
+elev_ok          = horizon_obstruction < sun_elevation < overhang_cutoff
+sun_entering_room = in_azimuth_range AND elev_ok
+```
+
+This is the degenerate case of the full physics solver when no protected point is configured. The 90° half-arc is physical fact (a window can only see sun that is on the exterior side of its wall plane), not a tuning knob.
 
 ---
 
@@ -204,62 +243,78 @@ https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=cl
 
 ---
 
-## 8. Controlled mode — physics model
+## 8. Unified physics model
 
-### The 4 parameters
+Every window is a physics model. Event Only and Controlled differ only in which parameters are in play and which questions the solver answers.
 
-Each Controlled-mode window proxy fits this parameter set once, then uses it forever:
+### Parameter set
 
-| Parameter | Units | Meaning |
-|---|---|---|
-| `wall_azimuth` | ° (0–360) | Compass direction the window's outward normal points |
-| `window_top_height` | cm, above floor | Height of the window's top edge (blind in fully-up state reveals sun ≤ this height) |
-| `point_depth` | cm, from window plane into the room | Horizontal distance from the window plane to the protected point |
-| `point_height` | cm, above floor | Height of the protected point above the floor |
+| Parameter | Units | Event Only | Controlled | Meaning |
+|---|---|---|---|---|
+| `wall_azimuth` | ° (0–360) | required | required | Compass direction the window's outward normal points |
+| `horizon_obstruction_elevation` | ° | required | required | Sun below this angle cannot illuminate the window (trees, hill, building) |
+| `overhang_cutoff_elevation` | ° | required | required | Sun above this angle is blocked by roof eave |
+| `window_top_height` | cm above floor | — | required | Top edge of window opening |
+| `point_depth` | cm from window plane | — | required | Distance to protected point |
+| `point_height` | cm above floor | — | required | Height of protected point |
+| `blind_travel_length` | cm | — | required | Measured during control-surface calibration, not a fitted param |
 
-Blind bottom height (the blind's lower edge when at position P% closed) is:
-`blind_bottom_height = window_top_height − P/100 × blind_travel_length`
+Blind bottom height at position P% closed is `window_top_height − P/100 × blind_travel_length`.
 
-where `blind_travel_length` is measured during control-surface calibration.
+### The two solver outputs
 
-### Required-position solver
+**`sun_entering_room`** (Event Only answer): direct sun reaches the room interior right now.
 
-Given current `(sun_az, sun_elev)` and the 4 parameters, the driver computes:
+```
+in_wall_arc    = |angular_diff(sun_azimuth, wall_azimuth)| < 90°
+elev_ok        = horizon_obstruction_elevation < sun_elevation < overhang_cutoff_elevation
+sun_entering_room = in_wall_arc AND elev_ok
+```
 
-1. Project sun vector onto the room coordinate frame (wall_azimuth rotates the horizontal component).
-2. Compute the ray from the protected point toward the sun.
-3. Find where that ray crosses the window plane — its height `h_window`.
-4. If `h_window > window_top_height` → sun comes in from above the window top; the blind can't help anyway (overhang / roof blocks sun). Command: 0% (fully up).
-5. If `h_window < floor` → ray goes down; no glare. Command: 0%.
-6. Else required blind_bottom_height = `h_window − safety_margin`; translate to P% via blind_travel_length. Command: clamp to [0, 100] and round to nearest probe step.
+**`required_blind_position`** (Controlled answer): smallest P% that blocks the sun ray from reaching the protected point.
 
-If `cloud_cover > cloud_threshold` (not sunny enough to cause glare), command 0% regardless.
+```
+if not sun_entering_room:
+    required_blind_position = 0   -- sun can't reach the protected point anyway
+else:
+    project sun vector into room-local frame (rotate by wall_azimuth)
+    compute the ray from protected point back toward the sun
+    find h_window = height where that ray crosses the window plane
+    if h_window > window_top_height:
+        required_blind_position = 0   -- sun comes in above window top (geometrically impossible given overhang, but clamp)
+    else:
+        required_blind_bottom = h_window − safety_margin
+        required_blind_position = clamp(0..100, (window_top_height − required_blind_bottom) / blind_travel_length × 100)
+        round to nearest probe_step
+```
 
-### Fitting the 4 parameters
+### Fitting parameters — one pipeline, two flavors
 
-Two calibration paths, chosen via `Calibration method` property:
+Both modes use the same calibration actions and the same least-squares solver. The only difference is how many parameters are being fit and what the observations constrain.
 
-**(a) Manual datetime calibration (blind fully closed)**
+**Manual datetime observations**
 
-Dealer observes glare at the protected point while the blind is at 100% closed. They note the datetime glare started and the datetime it ended. These two moments are the sun positions where the bottom edge of the fully-closed blind is *exactly* aligned with the ray from sun to protected point — two equality constraints on the 4 parameters.
+Each observation pair `(start_dt, end_dt)` encodes: *"between these two moments, the [sun was reaching the reference point / blind was no longer blocking sun at the protected point]."*
 
-One observation pair gives 2 constraints; two pairs give 4 constraints (fully determined). Dealer records 3–4 observation pairs across different sun positions (different times of year, different windows of the day) for a robust overdetermined fit.
+For Event Only — reference point is any sunny spot in the room's interior. Each pair constrains `wall_azimuth`, `horizon_obstruction_elevation`, `overhang_cutoff_elevation`:
+- `start_dt` sun position is on the boundary where `sun_entering_room` transitions false → true
+- `end_dt` sun position is on the boundary where `sun_entering_room` transitions true → false
 
-Dealer enters repeated observations via a list-style property or by calling `Calibrate From Date/Time Window` multiple times; each call appends to the constraint set.
+For Controlled (`blind fully closed`) — reference point is the protected point. Each pair constrains all 7 params:
+- sun position at `start_dt` is exactly aligned with the ray from the fully-closed blind's bottom edge to the protected point (glare just started leaking past)
+- sun position at `end_dt` similarly (glare just stopped reaching the protected point as the sun moved)
 
-**(b) Self-learn with lux sensor**
+**Observation count needed for convergence**:
+- Event Only (3 params): **2 pairs minimum**, 3+ recommended for robustness
+- Controlled (7 params): **4 pairs minimum** (preferably spread across seasons), 5–6 for robustness. Tape-measure shortcut — dealer enters `window_top_height`, `point_depth`, `point_height` directly, reducing to 4 fit params (same as Event Only + `wall_azimuth` already known) and 2 pairs suffice.
 
-Lux sensor binding provides live illuminance at (or near) the protected point. Driver does:
+**Self-learn with lux sensor** — same flow as previously designed (15-min sampling, probing in Controlled mode only, least-squares fit). Sensor placement determines which reference point is being calibrated; same solver fits either 3 or 7 params accordingly.
 
-1. **Sample every 15 minutes** during sun-above-horizon hours, recording `(az, elev, cloud_cover, blind_position, lux)`.
-2. **Automated probing** during low-cloud daytime periods: every `probe_interval` minutes, move the blind by `probe_step` (up or down within [0, 100]); after settle time (~30 s), read lux. The *transition* in lux for a given move at a given sun position is the constraint.
-3. **Classify each sample** as "sun reaches protected point" (lux > threshold with blind at position P) or "sun blocked" (lux ≤ threshold with blind at P). Each classified sample is a constraint: the ray from sun to protected point either does or does not pass above the blind's current bottom edge.
-4. **Fit** the 4 parameters via nonlinear least-squares (Levenberg-Marquardt or similar simple iterative solver in Lua) to satisfy as many constraints as possible.
-5. **Convergence test** — parameters stable within tolerance across last 3 refits, ≥N successful constraint samples (N ~ 50 with diverse sun positions). Fire `Model_Converged` and stop active probing.
+### After convergence
 
-After convergence: **raw sample data is discarded**. Only the 4 fitted parameters, `blind_travel_length`, and a small metadata record (convergence date, sample count used, residual error) are persisted. Ongoing observations are used for feedback correction (below) but not re-stored.
+Raw samples and observation datetimes are discarded; only the fitted parameters + small metadata (convergence date, residual error, sample count) persist. Feedback correction loop (§8b below) runs continuously in Controlled mode.
 
-### Feedback correction loop
+### 8b. Feedback correction loop (Controlled only)
 
 After each blind move in production:
 
@@ -314,23 +369,27 @@ During self-learn, raw samples are stored at **15-minute resolution** in a ring 
   - [ ] Open-Meteo client with retry/backoff
   - [ ] Parent periodic tick (sun every 1 min, weather every 10 min)
 
-- **Phase 4 — Glare logic (Event Only)**
+- **Phase 4 — Physics model (Event Only subset)**
+  - [ ] Shared physics solver in Lua — `sun_entering_room` path
   - [ ] Per-window decision loop with hysteresis state machine
   - [ ] Parent aggregation (`ANY_GLARE_ACTIVE`, count)
 
-- **Phase 5 — Event-mode calibration**
-  - [ ] `Calibrate From Date/Time Window` action — back-calculates azimuth, half-angle, elevation bounds from two observed timestamps
+- **Phase 5 — Calibration pipeline**
+  - [ ] `Record Calibration Observation` action — appends datetime pairs to observation log
+  - [ ] Least-squares solver in Lua (Levenberg-Marquardt or simple Gauss-Newton, handles 3-param Event Only fit and 7-param Controlled fit)
+  - [ ] `Start Self-Learn` / `Stop Self-Learn` / `Refit Model Now` / `Discard Calibration Data` actions
+  - [ ] Lux sensor binding; 15-min sampling with ring buffer
+  - [ ] Convergence test + `Model_Converged` event
+  - [ ] Discard raw samples after convergence; retain only fitted params + metadata
 
-- **Phase 5.5 — Controlled mode (physics-model blind control)**
-  - [ ] Mode property; skeleton for Controlled path
+- **Phase 5.5 — Controlled mode (blind control on top of the physics model)**
+  - [ ] Mode property; gate Controlled-only properties/actions/events
   - [ ] Shade binding and control-surface abstraction (`Percent`, `Timed Up-Down-Stop`, `Preset Slots`, `Binary`)
-  - [ ] Optional lux sensor binding
-  - [ ] Required-position solver (4-parameter physics, ray-to-window-plane intersection)
-  - [ ] Manual datetime calibration (multi-observation fit)
-  - [ ] Self-learn with lux sensor (15-min sampling, active probing, least-squares fit, convergence detection)
+  - [ ] Extended physics solver — `required_blind_position` using the 4 additional params
+  - [ ] Active probing during self-learn (Controlled mode only)
   - [ ] Feedback correction loop after each commanded move
   - [ ] Manual override detection + pause
-  - [ ] `Blind_Adjusted`, `Model_Converged` events
+  - [ ] `Blind_Adjusted`, `Manual_Override_Detected` events
 
 - **Phase 6 — Polish**
   - [ ] GitHub Releases autoupdater (self-install via `UpdateProjectC4i` SOAP + esphome handshake — see `~/.claude/c4-conventions.md` §3 and §3a)
