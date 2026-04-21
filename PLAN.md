@@ -88,8 +88,10 @@ Windows are removed by deleting the child proxy in Composer; the parent reconcil
 |---|---|---|---|
 | Mode | LIST | `Event Only` | `Event Only` / `Controlled` |
 | Wall azimuth (°) | NUMBER | 180 | 0=N, 90=E, 180=S, 270=W — outward normal of the window's wall |
-| Horizon obstruction elevation (°) | NUMBER | 5 | sun below this angle cannot illuminate the window (trees, hill, neighbor) |
-| Overhang cutoff elevation (°) | NUMBER | 70 | sun above this angle is blocked by roof eave / overhang |
+| Lower silhouette default (°) | NUMBER | 5 | uniform horizon-obstruction elevation used for azimuths with no explicit segment |
+| Lower silhouette segments | STRING | — | optional overrides, format `"180-225:28; 225-330:5"` (az_start-az_end:elev, semicolon-separated) |
+| Upper silhouette default (°) | NUMBER | 70 | uniform overhang cutoff used for azimuths with no explicit segment |
+| Upper silhouette segments | STRING | — | optional overrides, same format |
 | Cloud cover threshold (%) | NUMBER | 40 | direct-sun gating threshold — skip glare when clouds above this |
 | On-delay (min) | NUMBER | 5 | hysteresis — condition must hold this long before `Glare_Start` |
 | Off-delay (min) | NUMBER | 10 | hysteresis — condition must clear this long before `Glare_End` |
@@ -248,29 +250,49 @@ https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=cl
 
 Every window is a physics model. Event Only and Controlled differ only in which parameters are in play and which questions the solver answers.
 
+### The "skyline" mental model
+
+From the protected point (or in Event Only, any reference point in the room's sunlit area), looking outward at every compass direction (azimuth), there is:
+
+- A **lower silhouette** — how far up from horizontal until open sky becomes visible. Obstructions: trees, the house's own wings, the neighbor's roofline, hills.
+- An **upper silhouette** — how far down from zenith (overhead) until open sky becomes visible. Obstructions: the overhang above the window, the eave, a balcony, the ceiling itself when looking through the window.
+
+Sun can reach the reference point only when **both** conditions hold: `sun_elevation > lower_silhouette(sun_azimuth)` **and** `sun_elevation < upper_silhouette(sun_azimuth)` **and** sun is on the window's side of the wall.
+
+Both silhouettes are **functions of azimuth**, not scalars. A uniform obstruction (no neighbors, no trees) collapses to a scalar — that's the simplest case. A house with asymmetric wings or partial overhangs produces multi-segment silhouettes. The physics is the same either way.
+
+This is what actually explains seasonal behavior: a south-wing shadow blocks winter sun (sun is in azimuths where the lower silhouette is high), while a roof overhang blocks summer-noon sun (sun is above the upper silhouette in azimuths near solar noon). Only in the azimuth ranges where sun can pass *between* the silhouettes — and with the sun actually in that window of elevations — does glare occur.
+
 ### Parameter set
 
 | Parameter | Units | Event Only | Controlled | Meaning |
 |---|---|---|---|---|
 | `wall_azimuth` | ° (0–360) | required | required | Compass direction the window's outward normal points |
-| `horizon_obstruction_elevation` | ° | required | required | Sun below this angle cannot illuminate the window (trees, hill, building) |
-| `overhang_cutoff_elevation` | ° | required | required | Sun above this angle is blocked by roof eave |
+| `lower_silhouette` | list of `(az_start, az_end, elev)` segments with default | required | required | Piecewise-constant function; default for unspecified azimuths. "Sun below this elevation at this azimuth cannot reach the reference point." |
+| `upper_silhouette` | list of `(az_start, az_end, elev)` segments with default | required | required | Piecewise-constant function; default for unspecified azimuths. "Sun above this elevation at this azimuth is blocked by overhang/ceiling/eave." |
 | `window_top_height` | cm above floor | — | required | Top edge of window opening |
 | `point_depth` | cm from window plane | — | required | Distance to protected point |
 | `point_height` | cm above floor | — | required | Height of protected point |
 | `blind_travel_length` | cm | — | required | Measured during control-surface calibration, not a fitted param |
 
+**Simple case (backward-compatible):** both silhouettes store a single default scalar value; no segments. Fits the "one uniform horizon, one uniform overhang" small-param case the earlier design described.
+
+**Real-world case:** 1–3 segments per silhouette; 5–10 fitted parameters total for Event Only. Controlled adds the 3 geometry params + `blind_travel_length`.
+
 Blind bottom height at position P% closed is `window_top_height − P/100 × blind_travel_length`.
 
 ### The two solver outputs
 
-**`sun_entering_room`** (Event Only answer): direct sun reaches the room interior right now.
+**`sun_entering_room`** (Event Only answer): direct sun reaches the reference point right now.
 
 ```
 in_wall_arc    = |angular_diff(sun_azimuth, wall_azimuth)| < 90°
-elev_ok        = horizon_obstruction_elevation < sun_elevation < overhang_cutoff_elevation
-sun_entering_room = in_wall_arc AND elev_ok
+above_lower    = sun_elevation > lower_silhouette(sun_azimuth)
+below_upper    = sun_elevation < upper_silhouette(sun_azimuth)
+sun_entering_room = in_wall_arc AND above_lower AND below_upper
 ```
+
+`lower_silhouette(az)` and `upper_silhouette(az)` each look up the piecewise-constant function; fall back to the default value for azimuths not covered by any explicit segment.
 
 **`required_blind_position`** (Controlled answer): smallest P% that blocks the sun ray from reaching the protected point.
 
@@ -295,19 +317,21 @@ Both modes use the same calibration actions and the same least-squares solver. T
 
 **Manual datetime observations**
 
-Each observation pair `(start_dt, end_dt)` encodes: *"between these two moments, the [sun was reaching the reference point / blind was no longer blocking sun at the protected point]."*
+Each observation pair `(start_dt, end_dt)` encodes two (az, elev) points, one on each transition boundary. Each point lies on **either the lower or upper silhouette** — the solver infers which:
 
-For Event Only — reference point is any sunny spot in the room's interior. Each pair constrains `wall_azimuth`, `horizon_obstruction_elevation`, `overhang_cutoff_elevation`:
-- `start_dt` sun position is on the boundary where `sun_entering_room` transitions false → true
-- `end_dt` sun position is on the boundary where `sun_entering_room` transitions true → false
+- If the transition is "sun rising from below into view" → the (az, elev) at that moment lies on the `lower_silhouette`.
+- If the transition is "sun dropping from above into view" (i.e., dropping below an overhang) → the (az, elev) lies on the `upper_silhouette`.
 
-For Controlled (`blind fully closed`) — reference point is the protected point. Each pair constrains all 7 params:
-- sun position at `start_dt` is exactly aligned with the ray from the fully-closed blind's bottom edge to the protected point (glare just started leaking past)
-- sun position at `end_dt` similarly (glare just stopped reaching the protected point as the sun moved)
+Which applies is determined by the sun's elevation trajectory (ascending vs descending) at that moment and the resulting observation's consistency with the other observations.
 
-**Observation count needed for convergence**:
-- Event Only (3 params): **2 pairs minimum**, 3+ recommended for robustness
-- Controlled (7 params): **4 pairs minimum** (preferably spread across seasons), 5–6 for robustness. Tape-measure shortcut — dealer enters `window_top_height`, `point_depth`, `point_height` directly, reducing to 4 fit params (same as Event Only + `wall_azimuth` already known) and 2 pairs suffice.
+For Event Only, reference point is any sunny spot in the room's interior (or the lux sensor's position if self-learning). For Controlled (`blind fully closed`), reference point is the protected point.
+
+**Observation count**:
+- **Simple case (uniform silhouettes)**: 2–3 pairs fit the default values of both silhouettes.
+- **Asymmetric silhouettes (L-shaped house, partial overhang, side obstruction)**: 4–8 pairs, ideally spanning the azimuth range the sun traverses across seasons. More observations = more silhouette segments resolvable.
+- **Controlled's extra 4 params** (`window_top_height`, `point_depth`, `point_height`, `blind_travel_length`): either measured with tape (then only silhouettes are fit), or requires ~3 additional observations.
+
+Observations spread across seasons are especially valuable because they cover different azimuth ranges — a summer afternoon observation constrains the upper silhouette in the west, a winter noon observation constrains the lower silhouette in the south.
 
 **Self-learn with lux sensor** — same flow as previously designed (15-min sampling, probing in Controlled mode only, least-squares fit). Sensor placement determines which reference point is being calibrated; same solver fits either 3 or 7 params accordingly.
 
@@ -328,7 +352,9 @@ These corrections are applied as a small, bounded delta; if the delta grows larg
 
 ### Seasonal handling
 
-The physics model is keyed on sun position, not on date. The same `(az, elev)` cell produces the same required blind position regardless of month — the model transfers across the year by construction. The sun traces different (az, elev) envelopes in different seasons, but the 4 fitted parameters describe **geometry**, and geometry does not change with season.
+The physics model is keyed on sun position, not on date. The same `(az, elev)` produces the same required blind position regardless of month — **within the azimuth range covered by fitted silhouette segments**. Geometry does not change with season; the model transfers across the year by construction.
+
+**Caveat**: the silhouettes must cover the full azimuth range the sun traverses across the seasons. Summer-only calibration may not produce silhouette segments for winter-afternoon azimuths; the solver then falls back to the default silhouette value for those gaps, which may be wrong. Fix: calibrate across at least two seasons (or spread self-learn over ~3+ months).
 
 Out of scope for v1: tree leaf-on/leaf-off overlays, snow reflections, furniture moves. If support is added later, the design calls for a sparse `(week_of_year, az_bin, elev_bin) → correction_delta` overlay table — weekly granularity.
 
@@ -372,6 +398,8 @@ During self-learn, raw samples are stored at **15-minute resolution** in a ring 
 
 - **Phase 4 — Physics model (Event Only subset)**
   - [ ] Shared physics solver in Lua — `sun_entering_room` path
+  - [ ] Piecewise-constant silhouette data structure + azimuth lookup (with default fallback)
+  - [ ] Parser for `"az_start-az_end:elev; ..."` segment strings
   - [ ] Per-window decision loop with hysteresis state machine
   - [ ] Parent aggregation (`ANY_GLARE_ACTIVE`, count)
 
