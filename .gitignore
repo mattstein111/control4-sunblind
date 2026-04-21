@@ -1,0 +1,6 @@
+.DS_Store
+*.c4z
+build/
+dist/
+.vscode/
+.idea/
