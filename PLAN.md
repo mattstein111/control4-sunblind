@@ -449,11 +449,67 @@ During self-learn, raw samples are stored at **15-minute resolution** in a ring 
 
 ---
 
-## 10. Open questions
+## 10. Prior art — Home Assistant ecosystem
+
+The HA community has worked this problem for years. Event Only ≈ what HA blueprints do today; Controlled ≈ what Adaptive Cover / Adaptive Cover Pro do today. SunBlinds extends both with **user-selected protected point** + **two-point dual-lux calibration**, which nobody in HA has combined.
+
+### Baseline — HA blueprints (the v1 Event Only analog)
+
+**[Cover Control Automation (CCA)](https://github.com/hvorragend/ha-blueprints)** — hvorragend. HA forum topic 680539 (~2,600 replies, active 2026). De-facto best-of-breed blueprint.
+  - Inputs: `window_azimuth ± half_angle`, elevation min/max, outdoor lux, outdoor temp, weather state, calendar/schedule, ventilation lockout (open-window sensor), **manual-override detection with timeout**.
+  - Pattern universal across community blueprints: `window_azimuth ± half_angle` arc + `elevation > threshold`, AND'd with temp/lux/weather overrides.
+  - No overhang geometry, no protected-point ray-tracing.
+
+Other notable blueprints: `daniel-sc` (forum 584240), `mougeat` (forum 405948 — the originator).
+
+### Closest analogs — HACS integrations (the Controlled mode analog)
+
+**[Adaptive Cover](https://github.com/basbruss/adaptive-cover)** (basbruss) — the anchor project in HACS default.
+  - Computes **continuous blind position** from sun geometry to block direct sunlight.
+  - Models vertical, horizontal, and tilted (venetian) covers.
+  - Inputs: window azimuth, window height, distance from floor, cover height, slat depth + spacing (venetian).
+  - "Protected point" is implicitly the **floor line** — not a user-selected spot.
+  - **"Blindspot"** config: static azimuth range pre-shaded by neighboring buildings/trees (≈ our `silhouette_overrides`).
+  - Two modes: basic (pure geometry) + climate (temp/presence/lux override).
+
+**[Adaptive Cover Pro](https://github.com/jrhubott/adaptive-cover-pro)** (jrhubott, fork, ~67 stars) — closest existing analog to SunBlinds Controlled mode.
+  - **10-handler override pipeline**: force → weather → manual → custom → motion → cloud suppression → climate → glare zones → solar → default. Clean precedence model.
+  - **"Enhanced Geometric Accuracy"** — documents overhang/recess math; cross-validate our physics against this before shipping.
+  - **Explicit "Glare Zones"** config.
+  - Position verification + companion Lovelace card showing sun-vs-window geometry.
+
+**[langestefan/auto-sun-blind](https://github.com/langestefan/auto-sun-blind)** — older template-sensor approach, now superseded.
+
+### Non-HA reference math
+
+- **[pvlib-python](https://pvlib-python.readthedocs.io/)** — sun vector computation, gold-standard reference for solar position math.
+- **[ladybug-tools/honeybee-radiance](https://github.com/ladybug-tools/honeybee-radiance)** — full Radiance-based daylight/glare simulation. What architects use. Overkill for runtime blind control but the canonical reference for the geometry we're approximating.
+
+### What to borrow / cross-check
+
+1. **Adaptive Cover Pro's override pipeline architecture** (force > manual > climate > solar > default) — mirror this in the Controlled-mode state machine.
+2. **Manual-override detection with timeout** — battle-tested across HA blueprints and Adaptive Cover Pro. Steal the exact pattern: distinguish user moves from automation moves by comparing reported position against last commanded position within a tolerance window; if mismatch → engage override timeout.
+3. **Adaptive Cover Pro "Enhanced Geometric Accuracy" wiki** — cross-validate our `compute_required_blind_position` math against theirs before shipping Phase 5.5.
+4. **"Blindspot" / "Glare Zones"** — HA validates the static-obstruction-mask concept. Our `silhouette_overrides` is the equivalent escape hatch for dealers who can't do two-point calibration.
+5. **Lux-as-override (not training signal)** — HA pattern: close only if outdoor lux > threshold; skip on overcast days. Adaptive Cover Pro's "cloud suppression" reads cloud-cover/irradiance sensor. We're more ambitious — using lux as training signal *and* override — but keep the override path simple and dealer-understandable.
+
+### What SunBlinds has that HA doesn't
+
+- **User-selected protected point** (TV, bed, reading chair) — Adaptive Cover protects the floor line implicitly. Ours enables minimum-descent behavior.
+- **Two-point dual-lux-sensor calibration** — nobody in HA treats lux as training signal; it's universally consumed as an override gate. Our disparity-based single-event calibration is genuinely novel for this problem space.
+- **Parametric obstruction fitting** (overhang + wall_edge + horizon_feature) — Adaptive Cover's "Blindspot" is a manual mask; ours is a fitted model.
+
+### Outreach (optional)
+
+`basbruss` and `jrhubott` have solved adjacent problems and might be interested in the protected-point / two-point-calibration angle. Not required but could shortcut iteration. Defer until after v1 ships — easier to discuss with working code.
+
+---
+
+## 11. Open questions
 
 - Final driver icon — using 🕶️☀️ (sun + sunglasses emoji) as placeholder; will design a proper one before 1.0.
 - Should `Calibrate From Date/Time Window` (Event mode) *also* honor a third "glare observed midday at worst angle" datetime for peak-elevation calibration? Deferred unless needed.
 - License — MIT? Apache 2.0? Decide before first public release.
 - Recommended lux sensors list — Aqara TVOC, Hue motion, Zigbee2MQTT illuminance sensors, generic HA-bridged. Document after first installs.
-- Tilt blinds (venetian) — deferred beyond v1. Requires a second actuator axis and is uncommon in the install base we're targeting.
+- Tilt blinds (venetian) — deferred beyond v1. Requires a second actuator axis; Adaptive Cover models this, worth copying when we get to it.
 - Multi-protected-point per blind — deferred; v1 is one protected point per window.
