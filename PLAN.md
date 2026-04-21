@@ -143,10 +143,11 @@ Windows are removed by deleting the child proxy in Composer; the parent reconcil
 
 ### Variables
 
-- `GLARE_ACTIVE` (bool)
+- `GLARE_ACTIVE` (bool) — **primary state variable** for dealer programming. True while the window is currently in glare. Use this in IF-conditions when triggering off some other event (TV on, light switched on, door opened) to check whether glare is currently a concern.
+- `SUN_ENTERING_ROOM` (bool) — true whenever direct sun is geometrically reaching the room interior, regardless of cloud cover. Useful if the dealer wants to ignore the cloud threshold.
 - `WALL_AZIMUTH` (number)
-- `SUN_ENTERING_ROOM` (bool) — is direct sun currently reaching the room interior?
-- `LAST_GLARE_START` / `LAST_GLARE_END` (timestamp)
+- `LAST_GLARE_START` / `LAST_GLARE_END` (timestamp) — useful for "has glare been active in the last N minutes" conditional logic
+- `GLARE_ACTIVE_DURATION_SEC` (number) — seconds since `LAST_GLARE_START`; 0 when not active. Lets dealer write `IF glare has been active for > 10 minutes THEN ...`
 - `MODEL_CONVERGED` (bool)
 - Controlled-only: `TARGET_POSITION`, `CURRENT_POSITION`, `LUX_CURRENT`, `LEARNING_SAMPLES_COUNT`
 
