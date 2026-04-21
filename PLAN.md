@@ -88,10 +88,10 @@ Windows are removed by deleting the child proxy in Composer; the parent reconcil
 |---|---|---|---|
 | Mode | LIST | `Event Only` | `Event Only` / `Controlled` |
 | Wall azimuth (°) | NUMBER | 180 | 0=N, 90=E, 180=S, 270=W — outward normal of the window's wall |
-| Lower silhouette default (°) | NUMBER | 5 | uniform horizon-obstruction elevation used for azimuths with no explicit segment |
-| Lower silhouette segments | STRING | — | optional overrides, format `"180-225:28; 225-330:5"` (az_start-az_end:elev, semicolon-separated) |
-| Upper silhouette default (°) | NUMBER | 70 | uniform overhang cutoff used for azimuths with no explicit segment |
-| Upper silhouette segments | STRING | — | optional overrides, same format |
+| Obstruction model | readonly JSON | — | fitted parametric obstructions (overhangs, wall_edges, horizon_features) |
+| Protected point sensor | binding | — | primary lux sensor at the point to defend |
+| Vantage point sensor | binding | — | optional temporary lux sensor used for two-point calibration; can be removed after `Model_Converged` |
+| Vantage offset | STRING | — | `(Δx=+50, Δy=0, Δz=0)` cm relative to protected point; required if vantage sensor bound |
 | Cloud cover threshold (%) | NUMBER | 40 | direct-sun gating threshold — skip glare when clouds above this |
 | On-delay (min) | NUMBER | 5 | hysteresis — condition must hold this long before `Glare_Start` |
 | Off-delay (min) | NUMBER | 10 | hysteresis — condition must clear this long before `Glare_End` |
@@ -252,32 +252,37 @@ Every window is a physics model. Event Only and Controlled differ only in which 
 
 ### The "skyline" mental model
 
-From the protected point (or in Event Only, any reference point in the room's sunlit area), looking outward at every compass direction (azimuth), there is:
+From the protected point, looking outward at every compass direction (azimuth), there is a lower silhouette (horizon + house wings + trees + neighbors) and an upper silhouette (overhang + eave + balcony + ceiling). Glare reaches the point only when `lower(az) < sun_elev < upper(az)` AND sun is on the window's side of the wall.
 
-- A **lower silhouette** — how far up from horizontal until open sky becomes visible. Obstructions: trees, the house's own wings, the neighbor's roofline, hills.
-- An **upper silhouette** — how far down from zenith (overhead) until open sky becomes visible. Obstructions: the overhang above the window, the eave, a balcony, the ceiling itself when looking through the window.
+The silhouettes are **functions of azimuth**. A south-wing shadow blocks winter sun by raising the lower silhouette at southern azimuths; a roof overhang blocks summer-noon sun by pulling down the upper silhouette at those azimuths. Only where the sun can pass between the two silhouettes does glare occur.
 
-Sun can reach the reference point only when **both** conditions hold: `sun_elevation > lower_silhouette(sun_azimuth)` **and** `sun_elevation < upper_silhouette(sun_azimuth)` **and** sun is on the window's side of the wall.
+### Parametric obstruction model (primary representation)
 
-Both silhouettes are **functions of azimuth**, not scalars. A uniform obstruction (no neighbors, no trees) collapses to a scalar — that's the simplest case. A house with asymmetric wings or partial overhangs produces multi-segment silhouettes. The physics is the same either way.
+Rather than storing silhouettes as sampled lookup tables (which need dense observation to fill in), the driver represents the world as a **small set of parametric obstructions**, each with 2–3 geometric parameters. The silhouette values at any azimuth are *computed* from the obstruction parameters on demand. This extrapolates to azimuths the sun didn't traverse on calibration days.
 
-This is what actually explains seasonal behavior: a south-wing shadow blocks winter sun (sun is in azimuths where the lower silhouette is high), while a roof overhang blocks summer-noon sun (sun is above the upper silhouette in azimuths near solar noon). Only in the azimuth ranges where sun can pass *between* the silhouettes — and with the sun actually in that window of elevations — does glare occur.
+Typical obstructions:
+
+| Obstruction | Parameters | Models |
+|---|---|---|
+| `overhang` | depth outward from wall (cm); height above window top (cm); azimuth range where it applies | roof eave, balcony above, deep window header |
+| `wall_edge` | azimuth of the edge as seen from the protected point (°); height the wall extends upward (cm, or "infinite" for the other wing of the house) | south wing of an L-shaped house, adjacent garage, neighbor's wall |
+| `horizon_feature` | azimuth range; height-angle cutoff (°) | tree line, hill, fence |
+
+A typical installation has 1 overhang + 1 wall_edge + maybe 1 horizon_feature = 5–8 fitted geometric parameters. Plus the physics params (wall_azimuth, and in Controlled mode the point coordinates and window_top_height).
+
+If the actual geometry doesn't fit the standard obstructions (rare — e.g. a cathedral-ceilinged greenhouse room), the model falls back to piecewise silhouette segments as stored overrides.
 
 ### Parameter set
 
 | Parameter | Units | Event Only | Controlled | Meaning |
 |---|---|---|---|---|
 | `wall_azimuth` | ° (0–360) | required | required | Compass direction the window's outward normal points |
-| `lower_silhouette` | list of `(az_start, az_end, elev)` segments with default | required | required | Piecewise-constant function; default for unspecified azimuths. "Sun below this elevation at this azimuth cannot reach the reference point." |
-| `upper_silhouette` | list of `(az_start, az_end, elev)` segments with default | required | required | Piecewise-constant function; default for unspecified azimuths. "Sun above this elevation at this azimuth is blocked by overhang/ceiling/eave." |
+| `obstructions` | list of typed obstructions (see table above) | required | required | Parametric description of the surrounding geometry |
+| `silhouette_overrides` | optional piecewise segments | — | — | Fallback for geometries the parametric obstructions can't capture |
 | `window_top_height` | cm above floor | — | required | Top edge of window opening |
 | `point_depth` | cm from window plane | — | required | Distance to protected point |
 | `point_height` | cm above floor | — | required | Height of protected point |
 | `blind_travel_length` | cm | — | required | Measured during control-surface calibration, not a fitted param |
-
-**Simple case (backward-compatible):** both silhouettes store a single default scalar value; no segments. Fits the "one uniform horizon, one uniform overhang" small-param case the earlier design described.
-
-**Real-world case:** 1–3 segments per silhouette; 5–10 fitted parameters total for Event Only. Controlled adds the 3 geometry params + `blind_travel_length`.
 
 Blind bottom height at position P% closed is `window_top_height − P/100 × blind_travel_length`.
 
@@ -311,29 +316,47 @@ else:
         round to nearest probe_step
 ```
 
-### Fitting parameters — one pipeline, two flavors
+### Fitting parameters — one pipeline, two input methods
 
-Both modes use the same calibration actions and the same least-squares solver. The only difference is how many parameters are being fit and what the observations constrain.
+The same least-squares solver fits the parametric obstructions from any combination of the following observation sources.
 
-**Manual datetime observations**
+#### Primary method: two-point dual-sensor calibration
 
-Each observation pair `(start_dt, end_dt)` encodes two (az, elev) points, one on each transition boundary. Each point lies on **either the lower or upper silhouette** — the solver infers which:
+The key efficiency unlock. **One sensor at the protected point** (kept permanently); **one sensor at a deliberately-chosen vantage point** (removed after calibration). A single glare event observed at both sensors yields 4 boundary transitions (A-starts, B-starts, A-ends, B-ends) at different (az, elev) — and crucially, the spatial offset between the two points gives the solver *disparity information* that no single sensor can provide.
 
-- If the transition is "sun rising from below into view" → the (az, elev) at that moment lies on the `lower_silhouette`.
-- If the transition is "sun dropping from above into view" (i.e., dropping below an overhang) → the (az, elev) lies on the `upper_silhouette`.
+Workflow:
 
-Which applies is determined by the sun's elevation trajectory (ascending vs descending) at that moment and the resulting observation's consistency with the other observations.
+1. Bind two lux sensors: `Protected point sensor` and `Vantage point sensor`.
+2. Dealer places sensors:
+   - Protected: at the spot to be defended (TV, pillow, chair).
+   - Vantage: at a **different** point in the room. Maximum disparity = maximum information. Good choices: 50+ cm closer to the window, or laterally offset toward the nearer-shadow edge.
+3. Dealer enters the vantage point's position relative to the protected point — `(Δx cm toward window, Δy cm lateral, Δz cm vertical)`.
+4. Dealer clicks `Start Two-Point Calibration`.
+5. Driver watches both sensors continuously, records every lux-threshold crossing at each, tags with sun position.
+6. After each glare event the fit runs; if converged, fires `Model_Converged`.
 
-For Event Only, reference point is any sunny spot in the room's interior (or the lux sensor's position if self-learning). For Controlled (`blind fully closed`), reference point is the protected point.
+Typical convergence: **1–3 glare events (i.e. 1–3 sunny days)**. After convergence the vantage sensor can be removed; the protected sensor stays for ongoing feedback correction.
 
-**Observation count**:
-- **Simple case (uniform silhouettes)**: 2–3 pairs fit the default values of both silhouettes.
-- **Asymmetric silhouettes (L-shaped house, partial overhang, side obstruction)**: 4–8 pairs, ideally spanning the azimuth range the sun traverses across seasons. More observations = more silhouette segments resolvable.
-- **Controlled's extra 4 params** (`window_top_height`, `point_depth`, `point_height`, `blind_travel_length`): either measured with tape (then only silhouettes are fit), or requires ~3 additional observations.
+#### Variant: manual two-point observation (no sensors)
 
-Observations spread across seasons are especially valuable because they cover different azimuth ranges — a summer afternoon observation constrains the upper silhouette in the west, a winter noon observation constrains the lower silhouette in the south.
+Dealer stands at each point with a phone lux-meter app during one glare event. Records 4 datetimes (A-start, B-start, A-end, B-end) + the spatial offset. One afternoon of observation feeds the same solver. No binding needed.
 
-**Self-learn with lux sensor** — same flow as previously designed (15-min sampling, probing in Controlled mode only, least-squares fit). Sensor placement determines which reference point is being calibrated; same solver fits either 3 or 7 params accordingly.
+#### Fallback: single-point datetime observations
+
+If only one sensor / one observation point is available, the solver still fits — it just needs more observation events (3–5 across different days) to converge. Each observation pair gives 2 boundary points at one reference position.
+
+#### Self-learn extension
+
+In Controlled mode with a bound lux sensor, the driver actively probes the blind by small increments during clear-sky periods, gathering many more constraint samples per day. This fills in the obstruction fit even faster when only the single protected-point sensor is bound (no vantage sensor needed).
+
+### Observation-to-constraint encoding
+
+Each recorded boundary point is a constraint on the obstruction model:
+
+- **"Sun at (az, elev) reaches point P"** — the sun's ray from (az, elev) through the window plane lands inside the "visible sky cone" from P at that azimuth. Equivalent: `lower(az) < elev < upper(az)` computed from current obstruction params.
+- **"Sun at (az, elev) does NOT reach point P"** — the negation.
+
+The solver minimizes the residual: for each observation, the distance from the sun position to the nearest silhouette boundary implied by the current obstruction params. Converges when total residual is below threshold.
 
 ### After convergence
 
@@ -352,9 +375,7 @@ These corrections are applied as a small, bounded delta; if the delta grows larg
 
 ### Seasonal handling
 
-The physics model is keyed on sun position, not on date. The same `(az, elev)` produces the same required blind position regardless of month — **within the azimuth range covered by fitted silhouette segments**. Geometry does not change with season; the model transfers across the year by construction.
-
-**Caveat**: the silhouettes must cover the full azimuth range the sun traverses across the seasons. Summer-only calibration may not produce silhouette segments for winter-afternoon azimuths; the solver then falls back to the default silhouette value for those gaps, which may be wrong. Fix: calibrate across at least two seasons (or spread self-learn over ~3+ months).
+The physics model is keyed on sun position, not on date. Parametric obstructions describe physical geometry, which does not change with season — so once fit, the model predicts correctly for every day of the year, including sun positions that weren't sampled during calibration. Extrapolation across seasons is handled by the physics, not by having observed every relevant azimuth.
 
 Out of scope for v1: tree leaf-on/leaf-off overlays, snow reflections, furniture moves. If support is added later, the design calls for a sparse `(week_of_year, az_bin, elev_bin) → correction_delta` overlay table — weekly granularity.
 
